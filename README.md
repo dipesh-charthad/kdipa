@@ -1,2 +1,2 @@
-# personal-repos
+# kdipa
 my code stuff
