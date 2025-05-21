@@ -10,17 +10,22 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any
 from opencensus.ext.azure.log_exporter import AzureLogHandler
+from opencensus.trace import config_integration
+from opencensus.trace.samplers import AlwaysOnSampler
+from opencensus.trace.tracer import Tracer
+from opencensus.ext.azure.trace_exporter import AzureExporter
+from opencensus.ext.fastapi.fastapi_middleware import FastAPIMiddleware
 from config import Config
 
 from azure_search_service import AzureSearchClient
 from azure_openai_service import AzureOpenAIClient
 from embedding import generate_embeddings, chunk_json, clean_data
 
-# Constants for error messages
-ERROR_APP_DATA_DICT = "application_data must be a dictionary"
-ERROR_FIELDS_LIST = "fields must be a list"
-ERROR_FILTER_EXPR_STR = "filter_expr must be a string"
-ERROR_TOP_POSITIVE = "top must be a positive integer"
+# Define constants for error messages to avoid duplication
+ERR_APP_DATA_DICT = "application_data must be a dictionary"
+ERR_FIELDS_LIST = "fields must be a list"
+ERR_FILTER_EXPR_STR = "filter_expr must be a string"
+ERR_TOP_POSITIVE_INT = "top must be a positive integer"
 
 # Configure logging
 logging.basicConfig(
@@ -42,10 +47,22 @@ instrumentation_key = Config.APPLICATION_INSIGHTS_INSTRUMENTATION_KEY
 # Add Azure Application Insights handler if key is available
 if instrumentation_key:
     try:
-        # The correct way to initialize AzureLogHandler with an instrumentation key
-        azure_handler = AzureLogHandler(connection_string=f'InstrumentationKey={instrumentation_key}')
+        # Properly configure Application Insights for both logs and traces
+        # Configure the connection string in the proper format
+        connection_string = f'InstrumentationKey={instrumentation_key}'
+        
+        # Set up logging to Application Insights
+        azure_handler = AzureLogHandler(connection_string=connection_string)
         logger.addHandler(azure_handler)
-        logger.info("Application Insights logging enabled")
+        
+        # Configure opencensus for proper trace collection
+        config_integration.trace_integrations(['logging', 'requests'])
+        azure_exporter = AzureExporter(connection_string=connection_string)
+        
+        # Create a tracer that will send traces to Azure
+        tracer = Tracer(exporter=azure_exporter, sampler=AlwaysOnSampler())
+        
+        logger.info("Application Insights logging and tracing enabled")
     except Exception as e:
         logger.error(f"Failed to initialize Application Insights logging: {str(e)}")
 else:
@@ -62,6 +79,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Add Application Insights middleware for FastAPI to track requests properly
+if instrumentation_key:
+    try:
+        app.add_middleware(
+            FastAPIMiddleware,
+            exporter=azure_exporter,
+            sampler=AlwaysOnSampler(),
+        )
+    except Exception as e:
+        logger.error(f"Failed to add FastAPI middleware for Application Insights: {str(e)}")
 
 # Initialize clients
 try:
@@ -81,6 +109,7 @@ class ApplicationAnalysisRequest(BaseModel):
     filter_expr: Optional[str] = Field(None, description="Optional filter expression for search")
     top_similar: int = Field(3, description="Number of similar applications to retrieve", ge=1, le=10)
 
+    # print(f"Application Data: {json.dumps(application_data, indent=2)}")
 
 def extract_field_values(application_data, fields):
     """
@@ -97,18 +126,19 @@ def extract_field_values(application_data, fields):
         TypeError: If application_data is not a dictionary or fields is not a list
     """
     if not isinstance(application_data, dict):
-        logger.error(ERROR_APP_DATA_DICT)
-        raise TypeError(ERROR_APP_DATA_DICT)
+        logger.error(ERR_APP_DATA_DICT)
+        raise TypeError(ERR_APP_DATA_DICT)
         
     if not isinstance(fields, list):
-        logger.error(ERROR_FIELDS_LIST)
-        raise TypeError(ERROR_FIELDS_LIST)
+        logger.error(ERR_FIELDS_LIST)
+        raise TypeError(ERR_FIELDS_LIST)
     
     values = []
     for field in fields:
         value = application_data.get(field)
-        if value:  # If the value exists and is not None/empty
-            values.append(str(value))  # Convert all values to string
+        if value:
+            # Simplified: removed redundant if/else with identical actions
+            values.append(str(value))
     return values
 
 
@@ -130,16 +160,16 @@ def find_similar_applications(application_data, filter_expr=None, top=3):
     """
     # Validate input parameters
     if not isinstance(application_data, dict):
-        logger.error(ERROR_APP_DATA_DICT)
-        raise TypeError(ERROR_APP_DATA_DICT)
+        logger.error(ERR_APP_DATA_DICT)
+        raise TypeError(ERR_APP_DATA_DICT)
         
     if filter_expr is not None and not isinstance(filter_expr, str):
-        logger.error(ERROR_FILTER_EXPR_STR)
-        raise TypeError(ERROR_FILTER_EXPR_STR)
+        logger.error(ERR_FILTER_EXPR_STR)
+        raise TypeError(ERR_FILTER_EXPR_STR)
         
     if not isinstance(top, int) or top <= 0:
-        logger.error(ERROR_TOP_POSITIVE)
-        raise ValueError(ERROR_TOP_POSITIVE)
+        logger.error(ERR_TOP_POSITIVE_INT)
+        raise ValueError(ERR_TOP_POSITIVE_INT)
     
     try:
         json_chunks = chunk_json(application_data)
@@ -177,7 +207,7 @@ async def root():
     Returns:
         dict: Service status information
     """
-    try:
+    try:       
         return {
             "message": "Application is running",
             "allowed_methods": ["GET", "POST"],
@@ -233,8 +263,8 @@ def preprocess_application_data(application_data):
         TypeError: If application_data is not a dictionary
     """
     if not isinstance(application_data, dict):
-        logger.error(ERROR_APP_DATA_DICT)
-        raise TypeError(ERROR_APP_DATA_DICT)
+        logger.error(ERR_APP_DATA_DICT)
+        raise TypeError(ERR_APP_DATA_DICT)
     
     try:
         processed_data = clean_data(application_data)
@@ -256,16 +286,9 @@ def preprocess_application_data(application_data):
         raise
 
 
+# Helper functions to reduce cognitive complexity in analyze_application_endpoint
 def sanitize_application_data(app_data):
-    """
-    Helper function to sanitize application data.
-    
-    Args:
-        app_data (dict): Application data to sanitize
-        
-    Returns:
-        dict: Sanitized application data
-    """
+    """Helper function to sanitize application data"""
     sanitized_data = {}
     large_text_fields = ["companyOutput", "termsAndConditions", "contributionType"]
     
@@ -275,31 +298,21 @@ def sanitize_application_data(app_data):
             sanitized_data[key] = value[:1000] + "..."
         else:
             sanitized_data[key] = value
-            
+    
     return sanitized_data
 
 
-def prepare_search_query(app_data, essential_fields):
-    """
-    Helper function to prepare search query from application data.
-    
-    Args:
-        app_data (dict): Application data
-        essential_fields (list): List of essential fields to include in query
-        
-    Returns:
-        tuple: (field_values, query_text)
-    """
+def prepare_query_for_search(sanitized_data, essential_fields):
+    """Helper function to prepare query for search"""
     field_values = []
     
     for field in essential_fields:
-        value = app_data.get(field)
+        value = sanitized_data.get(field)
         if value:
-            # Truncate any value to 200 characters max
-            field_values.append(str(value)[:200])
+            # Simplified: no need for different handling based on type
+            field_values.append(str(value)[:200])  # Limit size for all types
     
-    query_text = " ".join(field_values) if field_values else "*"
-    return field_values, query_text
+    return " ".join(field_values) if field_values else "*"
 
 
 @app.post("/analyze-application")
@@ -307,13 +320,12 @@ async def analyze_application_endpoint(request: ApplicationAnalysisRequest):
     """
     Optimized REST API endpoint for application analysis.
     """
-    try:
+    try:        
         # Log received request
         logger.info("Received application analysis request")
 
         # Preprocess data with minimal operations
         try:
-            # Use helper function to sanitize data
             sanitized_application_data = sanitize_application_data(request.application_data)
         except TypeError as e:
             logger.error(f"Invalid application data: {str(e)}")
@@ -323,8 +335,8 @@ async def analyze_application_endpoint(request: ApplicationAnalysisRequest):
             )
         
         # Find similar applications using hybrid search
-        try:
-            # Implement minimal chunking for large applications
+        try:           
+            # Determine if chunking is needed based on data size
             app_data_str = json.dumps(sanitized_application_data)
             json_chunks = chunk_json(sanitized_application_data) if len(app_data_str) > 8000 else [sanitized_application_data]
                 
@@ -339,8 +351,8 @@ async def analyze_application_endpoint(request: ApplicationAnalysisRequest):
                 "numberOfEquityOrShares", "totalInvestmentValue",
             ]
             
-            # Use helper function to prepare search query
-            _, query_text = prepare_search_query(sanitized_application_data, essential_fields)
+            # Prepare query text from essential fields
+            query_text = prepare_query_for_search(sanitized_application_data, essential_fields)
             
             similar_applications = search_client.hybrid_search(
                 query_text=query_text,
@@ -356,9 +368,11 @@ async def analyze_application_endpoint(request: ApplicationAnalysisRequest):
                 detail=f"Error finding similar applications: {str(e)}"
             )
 
-        # Start timing the model analysis and analyze application
+        # Start timing the model analysis
         start_time = time.time()
-        try:
+        
+        # Analyze application
+        try:           
             analysis_result = openai_client.analyze_application(sanitized_application_data, similar_applications)
         except Exception as e:
             logger.error(f"Error analyzing application: {str(e)}")
@@ -381,8 +395,9 @@ async def analyze_application_endpoint(request: ApplicationAnalysisRequest):
             }
         })
         
-        # Log the decision to App Insights if available
+        # Log the decision to App Insights
         if "Decision" in analysis_result:
+            # For consistency, send both trace and log
             logger.info(
                 f"Application decision: {analysis_result['Decision']}",
                 extra={'custom_dimensions': {
